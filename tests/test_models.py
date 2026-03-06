@@ -21,6 +21,16 @@ class TestPromptValidation:
             QueryRequest(prompt="")
 
 
+class TestModelValidation:
+    def test_valid_model(self):
+        req = QueryRequest(prompt="test", model="sonnet")
+        assert req.model == "sonnet"
+
+    def test_empty_model_rejected(self):
+        with pytest.raises(ValidationError, match="model"):
+            QueryRequest(prompt="test", model="")
+
+
 class TestApiKeyResolution:
     def test_falls_back_to_env_vars(self):
         req = QueryRequest(prompt="test")
@@ -62,6 +72,10 @@ class TestFileValidation:
     def test_path_traversal_rejected(self):
         with pytest.raises(ValidationError, match="Path traversal not allowed"):
             QueryRequest(prompt="test", files={"../etc/passwd": "evil"})
+
+    def test_root_path_rejected(self):
+        with pytest.raises(ValidationError, match="Path traversal not allowed"):
+            QueryRequest(prompt="test", files={"/": "evil"})
 
     def test_too_many_files_rejected(self):
         files = {f"file{i}.txt": "content" for i in range(21)}
@@ -163,3 +177,17 @@ class TestTimeoutBounds:
     def test_valid_timeout(self):
         req = QueryRequest(prompt="test", timeout=60)
         assert req.timeout == 60
+
+
+class TestMaxTurnsBounds:
+    def test_default_max_turns(self):
+        req = QueryRequest(prompt="test")
+        assert req.max_turns is None
+
+    def test_max_turns_must_be_positive(self):
+        with pytest.raises(ValidationError, match="max_turns"):
+            QueryRequest(prompt="test", max_turns=0)
+
+    def test_valid_max_turns(self):
+        req = QueryRequest(prompt="test", max_turns=1)
+        assert req.max_turns == 1

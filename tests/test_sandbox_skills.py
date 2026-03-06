@@ -1,11 +1,14 @@
 import asyncio
 import base64
 import json
-from unittest.mock import AsyncMock, MagicMock, PropertyMock
+import logging
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from sandstorm.config import _build_agent_config, _validate_sandstorm_config
+import sandstorm.config as config_mod
+from sandstorm.config import _build_agent_config, _validate_sandstorm_config, load_sandstorm_config
 from sandstorm.files import (
     _MAX_EXTRACT_FILE_SIZE,
     _MAX_EXTRACT_FILES,
@@ -57,6 +60,40 @@ class TestValidateSandstormConfigSkills:
         config = _validate_sandstorm_config({"template_skills": 1})
         assert "template_skills" not in config
 
+    def test_max_turns_must_be_positive(self):
+        config = _validate_sandstorm_config({"max_turns": 0})
+        assert "max_turns" not in config
+
+    def test_timeout_must_be_within_bounds(self):
+        config = _validate_sandstorm_config({"timeout": 3601})
+        assert "timeout" not in config
+
+    def test_empty_model_dropped(self):
+        config = _validate_sandstorm_config({"model": ""})
+        assert "model" not in config
+
+    def test_whitespace_model_dropped(self):
+        config = _validate_sandstorm_config({"model": "   "})
+        assert "model" not in config
+
+    def test_load_sandstorm_config_reads_utf8(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "sandstorm.json").write_text('{"model":"sonnet"}', encoding="utf-8")
+        monkeypatch.setattr(config_mod, "_config_cache", None)
+        monkeypatch.setattr(config_mod, "_config_mtime", 0.0)
+
+        original_read_text = Path.read_text
+        seen: dict[str, str | None] = {}
+
+        def _read_text(self, *args, **kwargs):
+            seen["encoding"] = kwargs.get("encoding")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _read_text)
+
+        assert load_sandstorm_config() == {"model": "sonnet"}
+        assert seen["encoding"] == "utf-8"
+
 
 class TestLoadSkillsDir:
     def test_loads_skill_md_from_subdirs(self, tmp_path, monkeypatch):
@@ -99,6 +136,33 @@ class TestLoadSkillsDir:
 
         result = _load_skills_dir("skills")
         assert result == {"test-skill": {"SKILL.md": "content"}}
+
+    def test_skips_non_utf8_files(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.chdir(tmp_path)
+        skills_dir = tmp_path / "skills"
+        skill = skills_dir / "test-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("content")
+        (skill / "binary.dat").write_bytes(b"\xff\xfe\xfd")
+
+        with caplog.at_level(logging.WARNING, logger="sandstorm.files"):
+            result = _load_skills_dir("skills")
+
+        assert result == {"test-skill": {"SKILL.md": "content"}}
+        assert "skipping non-UTF-8 file 'binary.dat' in skill 'test-skill'" in caplog.text
+
+    def test_skips_skill_when_skill_md_is_non_utf8(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.chdir(tmp_path)
+        skills_dir = tmp_path / "skills"
+        skill = skills_dir / "broken-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_bytes(b"\xff\xfe\xfd")
+
+        with caplog.at_level(logging.WARNING, logger="sandstorm.files"):
+            result = _load_skills_dir("skills")
+
+        assert result == {}
+        assert "skipping 'broken-skill' (SKILL.md is not readable as UTF-8)" in caplog.text
 
     def test_ignores_non_directories(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -441,6 +505,17 @@ class TestTimeoutResolution:
 
 
 @pytest.mark.usefixtures("_api_keys")
+class TestMaxTurnsResolution:
+    def test_request_max_turns_overrides_config(self):
+        config, _ = _build_agent_config(_req(max_turns=1), {"max_turns": 5}, {})
+        assert config["max_turns"] == 1
+
+    def test_config_max_turns_used_when_request_is_none(self):
+        config, _ = _build_agent_config(_req(), {"max_turns": 5}, {})
+        assert config["max_turns"] == 5
+
+
+@pytest.mark.usefixtures("_api_keys")
 class TestBuildAgentConfigOutputFormat:
     _FMT_A = {"type": "json_schema", "schema": {"type": "object"}}
     _FMT_B = {"type": "json_schema", "schema": {"type": "array"}}
@@ -506,93 +581,129 @@ class TestBuildAgentConfigSystemPromptAppend:
 # ---------------------------------------------------------------------------
 
 
-def _make_entry(name, *, type_val="file", size=100, path=None):
-    """Create a mock sandbox file entry."""
-    entry = MagicMock()
-    entry.name = name
-    entry.path = path or f"/home/user/{name}"
-    entry.size = size
-    type_mock = MagicMock()
-    type_mock.value = type_val
-    type(entry).type = PropertyMock(return_value=type_mock if type_val else None)
-    return entry
+def _cmd_result(stdout=""):
+    """Create a mock command result."""
+    result = MagicMock()
+    result.stdout = stdout
+    result.stderr = ""
+    result.exit_code = 0
+    result.error = None
+    return result
 
 
 class TestExtractGeneratedFiles:
-    def _sbx(self):
+    _MARKER = "/tmp/sandstorm.marker"
+
+    def _sbx(self, stdout=""):
         sbx = AsyncMock()
-        sbx.files.list = AsyncMock(return_value=[])
         sbx.files.read = AsyncMock(return_value=b"data")
+        sbx.commands.run = AsyncMock(side_effect=[_cmd_result(stdout), _cmd_result("")])
         return sbx
 
-    def test_skips_directories(self):
+    def test_returns_empty_when_no_recent_files(self):
         sbx = self._sbx()
-        sbx.files.list.return_value = [_make_entry("mydir", type_val="directory")]
-        result = asyncio.run(_extract_generated_files(sbx, set(), "req1"))
+        result = asyncio.run(_extract_generated_files(sbx, set(), "req1", self._MARKER))
         assert result == []
+        sbx.files.read.assert_not_called()
 
     def test_skips_dotfiles(self):
-        sbx = self._sbx()
-        sbx.files.list.return_value = [_make_entry(".bashrc")]
-        result = asyncio.run(_extract_generated_files(sbx, set(), "req1"))
+        sbx = self._sbx(".bashrc\t5\n")
+        result = asyncio.run(_extract_generated_files(sbx, set(), "req1", self._MARKER))
         assert result == []
 
     def test_skips_input_files(self):
-        sbx = self._sbx()
-        sbx.files.list.return_value = [_make_entry("input.csv")]
-        result = asyncio.run(_extract_generated_files(sbx, {"input.csv"}, "req1"))
+        sbx = self._sbx("input.csv\t5\n")
+        result = asyncio.run(_extract_generated_files(sbx, {"input.csv"}, "req1", self._MARKER))
         assert result == []
 
     def test_skips_oversized_files(self):
-        sbx = self._sbx()
-        sbx.files.list.return_value = [_make_entry("huge.bin", size=_MAX_EXTRACT_FILE_SIZE + 1)]
-        result = asyncio.run(_extract_generated_files(sbx, set(), "req1"))
+        sbx = self._sbx(f"huge.bin\t{_MAX_EXTRACT_FILE_SIZE + 1}\n")
+        result = asyncio.run(_extract_generated_files(sbx, set(), "req1", self._MARKER))
         assert result == []
 
     def test_caps_at_max_files(self):
-        sbx = self._sbx()
-        entries = [_make_entry(f"file{i}.txt", size=10) for i in range(15)]
-        sbx.files.list.return_value = entries
+        stdout = "".join(f"file{i}.txt\t10\n" for i in range(15))
+        sbx = self._sbx(stdout)
         sbx.files.read.return_value = b"x"
 
-        result = asyncio.run(_extract_generated_files(sbx, set(), "req1"))
+        result = asyncio.run(_extract_generated_files(sbx, set(), "req1", self._MARKER))
         assert len(result) == _MAX_EXTRACT_FILES
 
     def test_total_size_budget(self):
-        sbx = self._sbx()
-        # Each file is half the total budget + 1 byte, so only 1 fits
+        sbx = self._sbx("a.bin\t100\nb.bin\t100\n")
+        # Reported entry.size stays small here on purpose; the test verifies that the
+        # extraction budget still uses the actual bytes returned by sbx.files.read().
+        # Each returned payload is half the total budget + 1 byte, so only 1 fits.
         half_plus = _MAX_EXTRACT_TOTAL_SIZE // 2 + 1
-        entries = [_make_entry("a.bin", size=100), _make_entry("b.bin", size=100)]
-        sbx.files.list.return_value = entries
         sbx.files.read.return_value = b"x" * half_plus
 
-        result = asyncio.run(_extract_generated_files(sbx, set(), "req1"))
+        result = asyncio.run(_extract_generated_files(sbx, set(), "req1", self._MARKER))
         assert len(result) == 1
 
     def test_returns_json_encoded_file_events(self):
-        sbx = self._sbx()
+        sbx = self._sbx("output.txt\t11\n")
         raw = b"hello world"
-        sbx.files.list.return_value = [_make_entry("output.txt", size=len(raw))]
         sbx.files.read.return_value = raw
 
-        result = asyncio.run(_extract_generated_files(sbx, set(), "req1"))
+        result = asyncio.run(_extract_generated_files(sbx, set(), "req1", self._MARKER))
         assert len(result) == 1
 
         event = json.loads(result[0])
         assert event["type"] == "file"
         assert event["name"] == "output.txt"
+        assert event["relative_path"] == "output.txt"
         assert event["path"] == "/home/user/output.txt"
         assert event["size"] == len(raw)
         assert base64.b64decode(event["data"]) == raw
 
-    def test_handles_read_failure(self):
-        sbx = self._sbx()
-        entries = [_make_entry("good.txt", size=10), _make_entry("bad.txt", size=10)]
-        sbx.files.list.return_value = entries
-        sbx.files.read.side_effect = [b"ok", Exception("read error")]
+    def test_extracts_nested_files_touched_this_turn(self):
+        sbx = self._sbx("reports/summary.json\t6\ntop.txt\t3\n")
 
-        result = asyncio.run(_extract_generated_files(sbx, set(), "req1"))
+        async def _read(path, format="bytes"):
+            if path.endswith("summary.json"):
+                return b"nested"
+            return b"top"
+
+        sbx.files.read.side_effect = _read
+
+        result = asyncio.run(_extract_generated_files(sbx, set(), "req1", self._MARKER))
+        assert len(result) == 2
+
+        nested_event = json.loads(result[0])
+        top_event = json.loads(result[1])
+        assert nested_event["relative_path"] == "reports/summary.json"
+        assert nested_event["path"] == "/home/user/reports/summary.json"
+        assert top_event["relative_path"] == "top.txt"
+
+    def test_skips_nested_input_files_by_relative_path(self):
+        sbx = self._sbx("reports/input.csv\t10\n")
+        result = asyncio.run(
+            _extract_generated_files(sbx, {"reports/input.csv"}, "req1", self._MARKER)
+        )
+        assert result == []
+
+    def test_handles_read_failure(self):
+        sbx = self._sbx("good.txt\t10\nbad.txt\t10\n")
+
+        async def _read(path, format="bytes"):
+            if path.endswith("bad.txt"):
+                raise Exception("read error")
+            return b"ok"
+
+        sbx.files.read.side_effect = _read
+
+        result = asyncio.run(_extract_generated_files(sbx, set(), "req1", self._MARKER))
         # Only the successfully read file is returned
         assert len(result) == 1
         event = json.loads(result[0])
         assert event["name"] == "good.txt"
+
+    def test_recent_scan_is_marker_scoped_and_bounded(self):
+        sbx = self._sbx()
+
+        asyncio.run(_extract_generated_files(sbx, set(), "req1", self._MARKER))
+
+        scan_cmd = sbx.commands.run.await_args_list[0].args[0]
+        assert f"-cnewer {self._MARKER}" in scan_cmd
+        assert f"head -n {_MAX_EXTRACT_FILES + 1}" in scan_cmd
+        sbx.files.list.assert_not_called()

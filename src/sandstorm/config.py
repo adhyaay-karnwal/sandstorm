@@ -3,6 +3,7 @@
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 from .models import NAME_PATTERN, QueryRequest
 
@@ -106,7 +107,27 @@ def _validate_sandstorm_config(raw: dict) -> dict:
         logger.warning("sandstorm.json: allowed_tools entries must be strings — skipping")
         del validated["allowed_tools"]
 
+    if "max_turns" in validated and validated["max_turns"] < 1:
+        logger.warning("sandstorm.json: max_turns must be >= 1 — skipping")
+        del validated["max_turns"]
+
+    if "timeout" in validated and not 5 <= validated["timeout"] <= 3600:
+        logger.warning("sandstorm.json: timeout must be between 5 and 3600 — skipping")
+        del validated["timeout"]
+
+    if "model" in validated and not validated["model"].strip():
+        logger.warning("sandstorm.json: model must be a non-empty string — skipping")
+        del validated["model"]
+
     return validated
+
+
+def _first_defined(*values: Any) -> Any:
+    """Return the first value that is not None."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def load_sandstorm_config() -> dict | None:
@@ -131,7 +152,7 @@ def load_sandstorm_config() -> dict | None:
         return _config_cache
 
     try:
-        raw = json.loads(config_path.read_text())
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         logger.error("sandstorm.json: failed to read — %s", exc)
         return None
@@ -221,13 +242,13 @@ def _build_agent_config(
     elif env_append and not sys_prompt:
         sys_prompt = env_append
 
-    timeout = request.timeout or sandstorm_config.get("timeout") or 300
+    timeout = _first_defined(request.timeout, sandstorm_config.get("timeout"), 300)
 
     agent_config = {
         "prompt": request.prompt,
         "cwd": "/home/user",
-        "model": request.model or sandstorm_config.get("model"),
-        "max_turns": request.max_turns or sandstorm_config.get("max_turns"),
+        "model": _first_defined(request.model, sandstorm_config.get("model")),
+        "max_turns": _first_defined(request.max_turns, sandstorm_config.get("max_turns")),
         "system_prompt": sys_prompt,
         "output_format": (
             request.output_format

@@ -19,7 +19,7 @@ class QueryRequest(BaseModel):
         json_schema_extra={
             "examples": [
                 {
-                    "prompt": "Create hello.py that prints 'Hello, world!' and run it",
+                    "prompt": "Compare two pricing pages and summarize the main differences",
                     "model": "sonnet",
                     "timeout": 300,
                 }
@@ -45,10 +45,13 @@ class QueryRequest(BaseModel):
     )
     model: str | None = Field(
         None,
+        min_length=1,
         description="Model override (e.g. 'sonnet', 'opus'). Overrides sandstorm.json.",
     )
     max_turns: int | None = Field(
-        None, description="Max conversation turns. Overrides sandstorm.json."
+        None,
+        ge=1,
+        description="Max conversation turns (must be >= 1). Overrides sandstorm.json.",
     )
     output_format: dict | None = Field(
         default=None,
@@ -141,7 +144,7 @@ class QueryRequest(BaseModel):
         safe = {}
         for path, content in v.items():
             normalized = normpath(path).lstrip("/")
-            if normalized.startswith("..") or normalized == ".":
+            if not normalized or normalized.startswith("..") or normalized == ".":
                 raise ValueError(f"Path traversal not allowed: {path}")
             safe[normalized] = content
         return safe

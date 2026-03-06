@@ -1,6 +1,7 @@
 """File upload, skills loading, and file extraction for E2B sandboxes."""
 
 import base64
+import contextlib
 import json
 import logging
 import posixpath
@@ -19,6 +20,7 @@ _MAX_EXTRACT_FILE_SIZE = 25 * 1024 * 1024  # 25 MB per file (Slack upload limit)
 # Note: Vercel serverless has a 4.5 MB response limit — base64-encoded files
 # larger than ~3 MB will exceed this. Self-hosted and Slack deployments are unaffected.
 _MAX_EXTRACT_TOTAL_SIZE = 50 * 1024 * 1024  # 50 MB total extraction budget
+_SANDBOX_HOME = "/home/user"
 
 
 async def _upload_files(sbx: AsyncSandbox, files: dict[str, str], request_id: str) -> None:
@@ -59,6 +61,17 @@ async def _upload_files(sbx: AsyncSandbox, files: dict[str, str], request_id: st
             ) from exc
 
 
+def _normalize_relative_path(path: str) -> str:
+    """Normalize a sandbox-relative path to a stable, slash-separated form."""
+    normalized = posixpath.normpath(path).lstrip("/")
+    return "" if normalized == "." else normalized
+
+
+def _has_hidden_segment(relative_path: str) -> bool:
+    """Return True if any path segment is hidden (starts with a dot)."""
+    return any(part.startswith(".") for part in relative_path.split("/") if part)
+
+
 def _load_skills_dir(skills_dir: str) -> dict[str, dict[str, str]]:
     """Read all files from each skill subdirectory into {name: {relative_path: content}}.
 
@@ -85,9 +98,29 @@ def _load_skills_dir(skills_dir: str) -> dict[str, dict[str, str]]:
             if file_path.name == ".DS_Store":
                 continue
             relative = file_path.relative_to(entry)
-            skill_files[str(relative)] = file_path.read_text()
+            try:
+                skill_files[str(relative)] = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                logger.warning(
+                    "skills_dir: skipping non-UTF-8 file %r in skill %r",
+                    str(relative),
+                    entry.name,
+                )
+        if "SKILL.md" not in skill_files:
+            logger.warning(
+                "skills_dir: skipping %r (SKILL.md is not readable as UTF-8)",
+                entry.name,
+            )
+            continue
         skills[entry.name] = skill_files
     return skills
+
+
+async def _create_extraction_marker(sbx: AsyncSandbox, request_id: str) -> str:
+    """Create a per-run marker file used to find outputs touched during this turn."""
+    marker_path = f"/tmp/sandstorm-extract-{request_id}.marker"
+    await sbx.commands.run(f"touch {shlex.quote(marker_path)}", timeout=10)
+    return marker_path
 
 
 async def _upload_skills(
@@ -132,76 +165,102 @@ async def _extract_generated_files(
     sbx: AsyncSandbox,
     input_file_names: set[str],
     request_id: str,
+    marker_path: str,
 ) -> list[str]:
     """Extract new files created by the agent in /home/user/.
 
-    Lists the working directory, filters out input files / dotfiles / directories,
-    reads each new file as bytes, and returns a list of JSON-encoded file events.
+    Uses a per-run marker file to find files touched during this turn, filters out
+    input files / dotfiles, reads each new file as bytes, and returns a list of
+    JSON-encoded file events.
     """
-    entries = await sbx.files.list("/home/user/")
+    input_paths = {_normalize_relative_path(path) for path in input_file_names}
+    candidate_limit = _MAX_EXTRACT_FILES + 1
+    excluded_inputs = "".join(
+        f" ! -path {shlex.quote(posixpath.join(_SANDBOX_HOME, path))}"
+        for path in sorted(input_paths)
+        if path
+    )
+    find_cmd = (
+        f"find {shlex.quote(_SANDBOX_HOME)} "
+        f"-path '*/.*' -prune -o -type f -cnewer {shlex.quote(marker_path)} "
+        f"! -size +{_MAX_EXTRACT_FILE_SIZE}c"
+        f"{excluded_inputs} "
+        f"-printf '%P\\t%s\\n' | head -n {candidate_limit}"
+    )
 
-    candidates = []
-    for entry in entries:
-        # Skip directories (entry.type is Optional[FileType])
-        if entry.type is None or entry.type.value != "file":
-            continue
-        # Skip dotfiles
-        if entry.name.startswith("."):
-            continue
-        # Skip files that were uploaded as input
-        if entry.name in input_file_names:
-            continue
-        # Skip known large files early (before downloading)
-        if entry.size > _MAX_EXTRACT_FILE_SIZE:
-            logger.info(
-                "[%s] Skipping oversized file: %s (%d bytes)",
-                request_id,
-                entry.name,
-                entry.size,
-            )
-            continue
-        candidates.append(entry)
+    try:
+        result = await sbx.commands.run(find_cmd, timeout=10)
+        candidates: list[tuple[str, int]] = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                relative_path, size_text = line.rsplit("\t", 1)
+                size = int(size_text)
+            except ValueError:
+                logger.warning("[%s] Skipping malformed extraction entry: %r", request_id, line)
+                continue
 
-    if not candidates:
-        logger.debug("[%s] No new files to extract", request_id)
-        return []
-
-    if len(candidates) > _MAX_EXTRACT_FILES:
-        logger.info(
-            "[%s] Capping file extraction at %d (found %d)",
-            request_id,
-            _MAX_EXTRACT_FILES,
-            len(candidates),
-        )
-        candidates = candidates[:_MAX_EXTRACT_FILES]
-
-    events: list[str] = []
-    total_size = 0
-    for entry in candidates:
-        try:
-            data = await sbx.files.read(entry.path, format="bytes")
-            raw = data if isinstance(data, bytes) else bytes(data)
-            size = len(raw)
-
-            if total_size + size > _MAX_EXTRACT_TOTAL_SIZE:
-                logger.info("[%s] Total extraction size limit reached", request_id)
-                break
-
-            total_size += size
-            encoded = base64.b64encode(raw).decode("ascii")
-            events.append(
-                json.dumps(
-                    {
-                        "type": "file",
-                        "name": entry.name,
-                        "path": entry.path,
-                        "size": size,
-                        "data": encoded,
-                    }
+            relative_path = _normalize_relative_path(relative_path)
+            if not relative_path or _has_hidden_segment(relative_path):
+                continue
+            if relative_path in input_paths:
+                continue
+            if size > _MAX_EXTRACT_FILE_SIZE:
+                logger.info(
+                    "[%s] Skipping oversized file: %s (%d bytes)",
+                    request_id,
+                    relative_path,
+                    size,
                 )
-            )
-            logger.info("[%s] Extracted file: %s (%d bytes)", request_id, entry.name, size)
-        except Exception:
-            logger.warning("[%s] Failed to read %s", request_id, entry.name, exc_info=True)
+                continue
+            candidates.append((relative_path, size))
 
-    return events
+        if not candidates:
+            logger.debug("[%s] No new files to extract", request_id)
+            return []
+
+        if len(candidates) > _MAX_EXTRACT_FILES:
+            logger.info(
+                "[%s] Capping file extraction at %d (found at least %d)",
+                request_id,
+                _MAX_EXTRACT_FILES,
+                len(candidates),
+            )
+            candidates = candidates[:_MAX_EXTRACT_FILES]
+
+        events: list[str] = []
+        total_size = 0
+        for relative_path, _reported_size in candidates:
+            path = posixpath.join(_SANDBOX_HOME, relative_path)
+            try:
+                data = await sbx.files.read(path, format="bytes")
+                raw = data if isinstance(data, bytes) else bytes(data)
+                size = len(raw)
+
+                if total_size + size > _MAX_EXTRACT_TOTAL_SIZE:
+                    logger.info("[%s] Total extraction size limit reached", request_id)
+                    break
+
+                total_size += size
+                encoded = base64.b64encode(raw).decode("ascii")
+                events.append(
+                    json.dumps(
+                        {
+                            "type": "file",
+                            "name": posixpath.basename(relative_path),
+                            "relative_path": relative_path,
+                            "path": path,
+                            "size": size,
+                            "data": encoded,
+                        }
+                    )
+                )
+                logger.info("[%s] Extracted file: %s (%d bytes)", request_id, relative_path, size)
+            except Exception:
+                logger.warning("[%s] Failed to read %s", request_id, relative_path, exc_info=True)
+
+        return events
+    finally:
+        with contextlib.suppress(Exception):
+            await sbx.commands.run(f"rm -f {shlex.quote(marker_path)}", timeout=5)

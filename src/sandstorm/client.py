@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from types import TracebackType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import httpx
 
 
 @dataclass
@@ -46,7 +50,7 @@ class SandstormClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
-        self._client = None
+        self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> SandstormClient:
         import httpx
@@ -101,10 +105,16 @@ class SandstormClient:
         Yields:
             SandstormEvent for each SSE event.
         """
-        from httpx_sse import aconnect_sse
-
         if self._client is None:
             raise RuntimeError("Use 'async with' to create the client")
+
+        try:
+            from httpx_sse import aconnect_sse
+        except ImportError as exc:
+            raise RuntimeError(
+                "SandstormClient.query() requires the client extra. "
+                'Install with: pip install "duvo-sandstorm[client]"'
+            ) from exc
 
         body: dict = {"prompt": prompt, **kwargs}
         if model is not None:
