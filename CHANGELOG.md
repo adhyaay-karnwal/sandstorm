@@ -2,6 +2,24 @@
 
 All notable changes to Sandstorm will be documented in this file.
 
+## [0.8.0] - 2026-03-07
+
+### Features
+
+- add starter-first onboarding with `ds init`, guided env setup, and six bundled starter projects
+- add API token auth with key rotation and protect run history on `/runs`
+- add Slack mounting on FastAPI, file extraction, and richer document-processing workflows
+- add a typed async Python client for health checks and SSE query streaming
+
+### Documentation
+
+- rewrite the getting-started, configuration, API, deployment, and examples docs for starter-based workflows
+- document package extras and add a dedicated Python client guide
+
+### CI/CD
+
+- verify distributable builds in normal CI before publish
+
 ## [0.7.1] - 2026-02-20
 
 ### Bug Fixes
@@ -165,5 +183,3 @@ All notable changes to Sandstorm will be documented in this file.
 ### Features
 
 - initial release of Sandstorm v0.1.0
-
-

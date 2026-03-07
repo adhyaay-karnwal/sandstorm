@@ -100,15 +100,32 @@
   <div class="empty-state">Loading...</div>
 </div>
 <script>
+const AUTH_REQUIRED_MESSAGE =
+  'Run history is private when API auth is enabled. Use an authenticated GET /runs request instead.';
+
 async function fetchRuns() {
   try {
     const res = await fetch('/runs');
-    if (!res.ok) return;
+    if (res.status === 401) {
+      renderUnavailable(AUTH_REQUIRED_MESSAGE);
+      return;
+    }
+    if (!res.ok) {
+      renderUnavailable('Dashboard data is temporarily unavailable.');
+      return;
+    }
     const runs = await res.json();
     render(runs);
   } catch (e) {
-    // Silently retry on next interval
+    renderUnavailable('Dashboard data is temporarily unavailable.');
   }
+}
+
+function renderUnavailable(message) {
+  const content = document.getElementById('content');
+  const stats = document.getElementById('stats');
+  content.innerHTML = `<div class="empty-state">${esc(message)}</div>`;
+  stats.innerHTML = '';
 }
 
 function render(runs) {
@@ -148,7 +165,8 @@ function render(runs) {
     </tr></thead><tbody>`;
 
   for (const run of runs) {
-    const dotClass = 'status-' + run.status;
+    const safeStatus = esc(run.status);
+    const dotClass = 'status-' + (run.status || '').replace(/[^a-z]/g, '');
     const duration = run.duration_secs != null ? run.duration_secs.toFixed(1) + 's' : '-';
     const cost = run.cost_usd != null ? '$' + run.cost_usd.toFixed(4) : '-';
     const turns = run.num_turns != null ? run.num_turns : '-';
@@ -156,7 +174,7 @@ function render(runs) {
     const model = run.model || '-';
 
     html += `<tr>
-      <td><span class="status-dot ${dotClass}"></span>${run.status}</td>
+      <td><span class="status-dot ${dotClass}"></span>${safeStatus}</td>
       <td class="run-id">${esc(run.id)}</td>
       <td class="prompt-cell" title="${esc(run.prompt)}">${esc(run.prompt)}</td>
       <td>${esc(model)}</td>
