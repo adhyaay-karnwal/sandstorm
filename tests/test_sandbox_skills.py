@@ -2,13 +2,19 @@ import asyncio
 import base64
 import json
 import logging
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import sandstorm.config as config_mod
-from sandstorm.config import _build_agent_config, _validate_sandstorm_config, load_sandstorm_config
+from sandstorm.config import (
+    _PROVIDER_ENV_KEYS,
+    _build_agent_config,
+    _validate_sandstorm_config,
+    load_sandstorm_config,
+)
 from sandstorm.files import (
     _MAX_EXTRACT_FILE_SIZE,
     _MAX_EXTRACT_FILES,
@@ -20,6 +26,9 @@ from sandstorm.models import QueryRequest
 
 
 class TestValidateSandstormConfigSkills:
+    def test_provider_env_keys_keep_linear_api_key(self):
+        assert "LINEAR_API_KEY" in _PROVIDER_ENV_KEYS
+
     def test_allowed_tools_valid(self):
         config = _validate_sandstorm_config({"allowed_tools": ["Skill", "Read", "Bash"]})
         assert config["allowed_tools"] == ["Skill", "Read", "Bash"]
@@ -223,6 +232,12 @@ def _api_keys(monkeypatch):
     monkeypatch.setenv("E2B_API_KEY", "e2b-test-key")
 
 
+@pytest.fixture(autouse=True)
+def _reset_loaded_dotenv_values(monkeypatch):
+    monkeypatch.setattr(config_mod, "_LOADED_DOTENV_VALUES", {})
+    monkeypatch.setattr(config_mod, "_env_mtime", 0.0)
+
+
 def _req(**kwargs) -> QueryRequest:
     kwargs.setdefault("prompt", "test")
     return QueryRequest(**kwargs)
@@ -365,6 +380,147 @@ class TestBuildAgentConfigMcpWhitelist:
     def test_no_config_mcp_servers(self):
         config, _ = _build_agent_config(_req(allowed_mcp_servers=["s1"]), {}, {})
         assert config["mcp_servers"] is None
+
+    def test_resolves_required_env_placeholders(self, monkeypatch):
+        monkeypatch.setenv("LINEAR_API_KEY", "lin-key")
+        cfg = {
+            "mcp_servers": {
+                "linear": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-linear"],
+                    "env": {"LINEAR_API_KEY": "${LINEAR_API_KEY}"},
+                }
+            }
+        }
+
+        config, _ = _build_agent_config(_req(), cfg, {})
+
+        assert config["mcp_servers"] == {
+            "linear": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-linear"],
+                "env": {"LINEAR_API_KEY": "lin-key"},
+            }
+        }
+
+    def test_resolves_default_placeholders(self, monkeypatch):
+        monkeypatch.delenv("MCP_BASE_URL", raising=False)
+        cfg = {"mcp_servers": {"svc": {"url": "${MCP_BASE_URL:-https://example.com/mcp}"}}}
+
+        config, _ = _build_agent_config(_req(), cfg, {})
+
+        assert config["mcp_servers"] == {"svc": {"url": "https://example.com/mcp"}}
+
+    def test_resolves_nested_placeholders(self, monkeypatch):
+        monkeypatch.setenv("API_TOKEN", "token-123")
+        monkeypatch.setenv("MCP_BASE_URL", "https://mcp.example.com")
+        cfg = {
+            "mcp_servers": {
+                "svc": {
+                    "url": "${MCP_BASE_URL}/server",
+                    "headers": {"Authorization": "Bearer ${API_TOKEN}"},
+                    "args": ["--token=${API_TOKEN}"],
+                }
+            }
+        }
+
+        config, _ = _build_agent_config(_req(), cfg, {})
+
+        assert config["mcp_servers"] == {
+            "svc": {
+                "url": "https://mcp.example.com/server",
+                "headers": {"Authorization": "Bearer token-123"},
+                "args": ["--token=token-123"],
+            }
+        }
+
+    def test_resolves_empty_env_var_as_empty_string(self, monkeypatch):
+        monkeypatch.setenv("LINEAR_API_KEY", "")
+        cfg = {"mcp_servers": {"linear": {"env": {"LINEAR_API_KEY": "${LINEAR_API_KEY}"}}}}
+
+        config, _ = _build_agent_config(_req(), cfg, {})
+
+        assert config["mcp_servers"] == {"linear": {"env": {"LINEAR_API_KEY": ""}}}
+
+    def test_reloads_project_dotenv_between_agent_runs(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+        cfg = {"mcp_servers": {"linear": {"env": {"LINEAR_API_KEY": "${LINEAR_API_KEY}"}}}}
+        env_path = tmp_path / ".env"
+
+        env_path.write_text("LINEAR_API_KEY=old-key\n", encoding="utf-8")
+        config, _ = _build_agent_config(_req(), cfg, {})
+        assert config["mcp_servers"] == {"linear": {"env": {"LINEAR_API_KEY": "old-key"}}}
+
+        env_path.write_text("LINEAR_API_KEY=new-key\n", encoding="utf-8")
+        config, _ = _build_agent_config(_req(), cfg, {})
+        assert config["mcp_servers"] == {"linear": {"env": {"LINEAR_API_KEY": "new-key"}}}
+
+    def test_reloads_values_loaded_from_dotenv_at_process_startup(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+        cfg = {"mcp_servers": {"linear": {"env": {"LINEAR_API_KEY": "${LINEAR_API_KEY}"}}}}
+        env_path = tmp_path / ".env"
+
+        env_path.write_text("LINEAR_API_KEY=old-key\n", encoding="utf-8")
+        config_mod.load_project_dotenv()
+
+        env_path.write_text("LINEAR_API_KEY=new-key\n", encoding="utf-8")
+        config, _ = _build_agent_config(_req(), cfg, {})
+
+        assert config["mcp_servers"] == {"linear": {"env": {"LINEAR_API_KEY": "new-key"}}}
+
+    def test_preserves_explicit_process_env_when_dotenv_rotates(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LINEAR_API_KEY", "shell-key")
+        cfg = {"mcp_servers": {"linear": {"env": {"LINEAR_API_KEY": "${LINEAR_API_KEY}"}}}}
+        env_path = tmp_path / ".env"
+
+        env_path.write_text("LINEAR_API_KEY=old-key\n", encoding="utf-8")
+        config_mod.load_project_dotenv()
+
+        env_path.write_text("LINEAR_API_KEY=new-key\n", encoding="utf-8")
+        config, _ = _build_agent_config(_req(), cfg, {})
+
+        assert config["mcp_servers"] == {"linear": {"env": {"LINEAR_API_KEY": "shell-key"}}}
+
+    def test_preserves_matching_shell_env_when_key_is_removed_from_dotenv(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LINEAR_API_KEY", "shared-key")
+        env_path = tmp_path / ".env"
+
+        env_path.write_text("LINEAR_API_KEY=shared-key\n", encoding="utf-8")
+        config_mod.load_project_dotenv()
+        assert config_mod._LOADED_DOTENV_VALUES == {}
+
+        env_path.unlink()
+        config_mod._refresh_project_dotenv()
+
+        assert config_mod._LOADED_DOTENV_VALUES == {}
+        assert os.environ["LINEAR_API_KEY"] == "shared-key"
+
+    def test_missing_required_placeholder_raises(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+        cfg = {"mcp_servers": {"linear": {"env": {"LINEAR_API_KEY": "${LINEAR_API_KEY}"}}}}
+
+        with pytest.raises(ValueError, match="mcp_servers.linear requires environment variable"):
+            _build_agent_config(_req(), cfg, {})
+
+    def test_filters_before_resolving_placeholders(self, monkeypatch):
+        monkeypatch.delenv("MISSING_KEY", raising=False)
+        cfg = {
+            "mcp_servers": {
+                "blocked": {"env": {"TOKEN": "${MISSING_KEY}"}},
+                "allowed": {"command": "ok"},
+            }
+        }
+
+        config, _ = _build_agent_config(_req(allowed_mcp_servers=["allowed"]), cfg, {})
+
+        assert config["mcp_servers"] == {"allowed": {"command": "ok"}}
 
 
 @pytest.mark.usefixtures("_api_keys")

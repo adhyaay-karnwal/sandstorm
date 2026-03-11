@@ -11,15 +11,24 @@ import urllib.request
 from pathlib import Path
 
 import click
-from dotenv import load_dotenv
+from dotenv import dotenv_values, set_key
+from e2b import AuthenticationException, SandboxException
 
 from sandstorm import _LOG_DATEFMT, _LOG_FORMAT, __version__
+from sandstorm.config import _get_config_path
+from sandstorm.config import load_project_dotenv as load_dotenv
 from sandstorm.e2b_api import E2BApiError, webhook_request
 from sandstorm.starter_catalog import (
     StarterDefinition,
     list_starters,
     resolve_starter,
     scaffold_files,
+)
+from sandstorm.toolpacks import (
+    ToolpackDefinition,
+    clone_mcp_server_config,
+    list_toolpacks,
+    resolve_toolpack,
 )
 
 _MODEL_OVERRIDE_ENV_KEYS = (
@@ -93,6 +102,75 @@ def _prompt_for_starter() -> StarterDefinition:
         show_choices=False,
     )
     return resolve_starter(starter_name)
+
+
+def _read_project_config_for_listing() -> tuple[dict | None, str | None]:
+    """Read sandstorm.json for informational status output."""
+    config_path = _get_config_path()
+    if not config_path.exists():
+        return None, None
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return None, str(exc)
+    if not isinstance(raw, dict):
+        return None, f"expected a JSON object, got {type(raw).__name__}"
+    return raw, None
+
+
+def _load_project_config_for_editing() -> tuple[Path, dict]:
+    """Load sandstorm.json as a mutable JSON object for CLI edits."""
+    config_path = _get_config_path()
+    if not config_path.exists():
+        raise click.ClickException(
+            "sandstorm.json not found in the current directory. "
+            "Run `ds init` first or create a sandstorm.json file."
+        )
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"Invalid sandstorm.json: {exc}") from exc
+    except OSError as exc:
+        raise click.ClickException(f"Failed to read {config_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise click.ClickException(
+            f"sandstorm.json must contain a JSON object, got {type(raw).__name__}."
+        )
+    return config_path, raw
+
+
+def _write_project_config(config_path: Path, config: dict) -> None:
+    """Write sandstorm.json with stable formatting."""
+    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+
+def _toolpack_status(config: dict | None, toolpack: ToolpackDefinition) -> str:
+    """Return installed status for a bundled toolpack."""
+    if config is None:
+        return "no project"
+    mcp_servers = config.get("mcp_servers")
+    if not isinstance(mcp_servers, dict):
+        return "not installed"
+    existing = mcp_servers.get(toolpack.mcp_server_name)
+    if existing is None:
+        return "not installed"
+    canonical = clone_mcp_server_config(toolpack)
+    if existing == canonical:
+        return "installed"
+    return "customized (use --force)"
+
+
+def _print_toolpack_list() -> None:
+    """Print the bundled toolpack catalog."""
+    config, error = _read_project_config_for_listing()
+    click.echo("Available toolpacks:\n")
+    for toolpack in list_toolpacks():
+        click.echo(f"  {toolpack.slug:18s} {toolpack.description}")
+        click.echo(f"  {'env vars:':18s} {', '.join(toolpack.required_env_vars)}")
+        click.echo(f"  {'status:':18s} {_toolpack_status(config, toolpack)}")
+        click.echo()
+    if error:
+        click.echo(f"Note: current sandstorm.json status unavailable ({error}).", err=True)
 
 
 def _is_empty_directory(path: Path) -> bool:
@@ -189,6 +267,21 @@ def _write_scaffold(destination: Path, files: dict[str, str]) -> None:
 def _get_env_value(name: str) -> str:
     """Return a trimmed environment value or an empty string."""
     return os.environ.get(name, "").strip()
+
+
+def _read_env_values(path: Path) -> dict[str, str]:
+    """Read a dotenv file into trimmed string values."""
+    if not path.is_file():
+        return {}
+    return {
+        key: value.strip() if isinstance(value, str) else ""
+        for key, value in dotenv_values(path).items()
+    }
+
+
+def _read_project_env_values() -> dict[str, str]:
+    """Read the current project's .env file for project-local secrets."""
+    return _read_env_values(Path.cwd() / ".env")
 
 
 def _copy_env_values(values: dict[str, str], *names: str) -> None:
@@ -289,6 +382,90 @@ def _sanitize_env_value(value: str) -> str:
     return value.replace("\r", " ").replace("\n", " ")
 
 
+def _upsert_env_file(
+    path: Path,
+    name: str,
+    value: str,
+    *,
+    quote_mode: str,
+    chmod_private_on_create: bool = False,
+) -> bool:
+    """Upsert a key in a dotenv-style file."""
+    sanitized = _sanitize_env_value(value)
+    current_values = _read_env_values(path)
+    if name in current_values and current_values[name] == sanitized:
+        return False
+
+    created = not path.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    set_key(str(path), name, sanitized, quote_mode=quote_mode)
+    if chmod_private_on_create and created:
+        path.chmod(0o600)
+    return True
+
+
+def _resolve_toolpack_env_vars(toolpack: ToolpackDefinition) -> dict[str, str]:
+    """Resolve required env vars for a bundled toolpack."""
+    values: dict[str, str] = {}
+    project_env = _read_project_env_values()
+    for name in toolpack.required_env_vars:
+        value = project_env.get(name, "") or _get_env_value(name)
+        if not value:
+            value = click.prompt(name, type=str).strip()
+        if not value:
+            raise click.ClickException(f"{name} is required to install {toolpack.slug}.")
+        values[name] = value
+    return values
+
+
+def _install_toolpack_config(
+    config: dict,
+    toolpack: ToolpackDefinition,
+    *,
+    force: bool,
+) -> bool:
+    """Apply a bundled toolpack to sandstorm.json."""
+    changed = False
+
+    mcp_servers = config.get("mcp_servers")
+    if mcp_servers is None:
+        mcp_servers = {}
+        config["mcp_servers"] = mcp_servers
+        changed = True
+    elif not isinstance(mcp_servers, dict):
+        raise click.ClickException("sandstorm.json field 'mcp_servers' must be an object.")
+
+    server_name = toolpack.mcp_server_name
+    canonical = clone_mcp_server_config(toolpack)
+    existing = mcp_servers.get(server_name)
+    if existing is None:
+        mcp_servers[server_name] = canonical
+        changed = True
+    elif existing != canonical:
+        if not force:
+            raise click.ClickException(
+                f"sandstorm.json already defines mcp_servers.{server_name}. "
+                "Use --force to overwrite it."
+            )
+        mcp_servers[server_name] = canonical
+        changed = True
+
+    allowed_tools = config.get("allowed_tools")
+    if allowed_tools is not None:
+        if not isinstance(allowed_tools, list) or not all(
+            isinstance(tool, str) for tool in allowed_tools
+        ):
+            raise click.ClickException(
+                "sandstorm.json field 'allowed_tools' must be a list of strings."
+            )
+        for tool in toolpack.allowed_tools:
+            if tool not in allowed_tools:
+                allowed_tools.append(tool)
+                changed = True
+
+    return changed
+
+
 def _uses_default_openrouter_base_url(env_values: dict[str, str], missing: list[str]) -> bool:
     """Return True when init will write the default OpenRouter Anthropic-compatible URL."""
     return (
@@ -327,15 +504,15 @@ def _maybe_prompt_for_env_file(destination: Path) -> tuple[bool, list[str]]:
         )
         return False, remaining_missing
 
-    env_lines = [
-        f"{name}={_sanitize_env_value(value)}"
+    env_values = {
+        name: _sanitize_env_value(value)
         for name, value in env_values.items()
         if _sanitize_env_value(value)
-    ]
-    if not env_lines:
+    }
+    if not env_values:
         return False, missing
-    env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
-    env_path.chmod(0o600)
+    for name, value in env_values.items():
+        _upsert_env_file(env_path, name, value, quote_mode="always", chmod_private_on_create=True)
     return True, []
 
 
@@ -440,6 +617,67 @@ def init(starter_name: str | None, directory: Path | None, show_list: bool, forc
 
 
 @cli.command()
+@click.argument("toolpack_name", required=False)
+@click.option("--list", "show_list", is_flag=True, help="List available toolpacks.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite the toolpack's existing MCP server config when it differs.",
+)
+def add(toolpack_name: str | None, show_list: bool, force: bool) -> None:
+    """Install a bundled toolpack into the current Sandstorm project."""
+    load_dotenv()
+
+    if show_list:
+        if toolpack_name:
+            raise click.UsageError("--list cannot be combined with a toolpack name.")
+        _print_toolpack_list()
+        return
+
+    if not toolpack_name:
+        raise click.UsageError("Provide a toolpack name or use --list.")
+
+    try:
+        toolpack = resolve_toolpack(toolpack_name)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="toolpack") from exc
+
+    config_path, config = _load_project_config_for_editing()
+    has_allowed_tools = "allowed_tools" in config
+    config_changed = _install_toolpack_config(config, toolpack, force=force)
+    env_values = _resolve_toolpack_env_vars(toolpack)
+    if config_changed:
+        _write_project_config(config_path, config)
+
+    env_path = Path.cwd() / ".env"
+    example_path = Path.cwd() / ".env.example"
+    env_files_changed = False
+    for name, value in env_values.items():
+        env_files_changed |= _upsert_env_file(
+            env_path,
+            name,
+            value,
+            quote_mode="always",
+            chmod_private_on_create=True,
+        )
+        env_files_changed |= _upsert_env_file(example_path, name, "", quote_mode="never")
+
+    if config_changed:
+        click.echo(f"Installed {toolpack.slug} in {config_path.name}.")
+    else:
+        click.echo(f"{toolpack.slug} is already installed.")
+    if toolpack.allowed_tools and not has_allowed_tools:
+        click.echo(
+            "Note: sandstorm.json has no allowed_tools list, so no MCP tool patterns were "
+            "added. All tools remain allowed until you define allowed_tools explicitly."
+        )
+    if env_files_changed:
+        click.echo("Updated .env and .env.example.")
+    else:
+        click.echo(".env and .env.example already match.")
+
+
+@cli.command()
 @click.argument("prompt")
 @click.option("--model", "-m", default=None, help="Model to use.")
 @click.option("--max-turns", default=None, type=int, help="Maximum agent turns.")
@@ -537,6 +775,9 @@ def query(
     except KeyboardInterrupt as exc:
         click.echo("Interrupted.", err=True)
         raise SystemExit(130) from exc
+    except (ValueError, RuntimeError, SandboxException, AuthenticationException) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1) from exc
 
 
 # ── Webhook management ─────────────────────────────────────────────────────
@@ -618,8 +859,6 @@ def webhook_register(url: str, secret: str | None, e2b_api_key: str | None, no_s
     click.echo(f"Webhook registered: {json.dumps(result, indent=2)}")
 
     if not no_save:
-        from dotenv import set_key
-
         env_path = str(Path.cwd() / ".env")
         set_key(env_path, "SANDSTORM_WEBHOOK_SECRET", secret)
         click.echo("Saved SANDSTORM_WEBHOOK_SECRET to .env", err=True)
@@ -784,8 +1023,6 @@ def slack_setup() -> None:
         click.echo(f"\n  Warning: Could not verify token: {exc}", err=True)
 
     # Step 4: Save to .env
-    from dotenv import set_key
-
     env_path = str(Path.cwd() / ".env")
     set_key(env_path, "SLACK_BOT_TOKEN", bot_token)
     set_key(env_path, "SLACK_APP_TOKEN", app_token)
